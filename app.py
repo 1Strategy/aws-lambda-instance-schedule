@@ -3,7 +3,6 @@ import json
 import datetime
 
 ec2_client = boto3.client('ec2')
-sns_client = boto3.client('sns')
 
 dry_run = True
 days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
@@ -12,15 +11,53 @@ now = datetime.datetime.utcnow()
 current_day = days[now.weekday()]
 current_hour = now.hour
 
+
 def handler(event, context):
-
-    # still need to handle regions
-
     print('current_day: %s' % current_day)
     print('current_hour: %s' % current_hour)
     print('dry_run: %s' % dry_run)
 
     # describe instance with tag name 'Schedule'
+    response = describe_instances()
+
+    # loop through described instances and store the id, state, and schedule value of those that have valid JSON data
+    instances_to_start = []
+    instances_to_stop = []
+
+    for reservation in response['Reservations']:
+        for instance in reservation['Instances']:
+            for tag in instance['Tags']:
+                if tag['Key'] == 'Schedule':
+                    try:
+                        schedule = json.loads(tag['Value'])
+
+                    # exception if schedule value is not valid json
+                    except Exception as e:
+                        print('Schedule tag value is either missing or not formatted correctly: '
+                              'Instance ID: %s, Value: %s' % (instance['InstanceId'], tag['Value']))
+                        print(e)
+                        continue
+
+                    else:
+                        # call determine_desired_state function and schedule
+                        desired_state = determine_desired_state(schedule)
+                        if instance['State']['Name'] != desired_state and instance['State']['Name'] in ('running', 'stopped'):
+                            if desired_state == 'running':
+                                instances_to_start.append(instance['InstanceId'])
+                            elif desired_state == 'stopped':
+                                instances_to_stop.append(instance['InstanceId'])
+
+    # start/stop instances based on schedule determined above
+    if instances_to_start:
+        print(start_instances(instances_to_start))
+    if instances_to_stop:
+        print(stop_instances(instances_to_stop))
+
+    return True
+
+
+# describe instances that have 'Schedule' tag
+def describe_instances():
     response = ec2_client.describe_instances(
         Filters=[
             {
@@ -32,91 +69,55 @@ def handler(event, context):
         ]
     )
 
-    # loop through described instances and store the id, state, and schedule value of those that have valid JSON data
-    instances = []
+    return response
 
-    for reservation in response['Reservations']:
-        for instance in reservation['Instances']:
-            for tag in instance['Tags']:
-                if tag['Key'] == 'Schedule':
-                    try:
-                        schedule = json.loads(tag['Value'])
-                    except Exception as e:
-                        print('Schedule tag value is either missing or not formatted correctly: '
-                              'Instance ID: %s, Value: %s' % (instance['InstanceId'], tag['Value']))
-                        print(e)
-                        continue
 
-                    print('InstanceId: %s, State: %s' % (instance['InstanceId'], instance['State']['Name']))
+# determine desired state of instance with schedule argument
+def determine_desired_state(schedule):
+    if current_day in schedule:
+        start_hour = schedule[current_day]['s'] if 's' in schedule[current_day] else None
+        end_hour = schedule[current_day]['e'] if 'e' in schedule[current_day] else None
 
-                    instances.append({
-                        'id': instance['InstanceId'],
-                        'schedule': schedule,
-                        'state': instance['State']['Name'],
-                    })
-
-    print('instances: %s' % instances)
-
-    # loop through instances with a valid JSON in the schedule value and determine desired state
-    for instance in instances[:]:
-
-        if current_day in instance['schedule']:
-
-            start_hour = instance['schedule'][current_day]['s'] if 's' in instance['schedule'][current_day] else None
-            end_hour = instance['schedule'][current_day]['e'] if 'e' in instance['schedule'][current_day] else None
-
-            print('start_hour: %s' % start_hour)
-            print('end_hour: %s' % end_hour)
-
-            if current_hour >= start_hour and current_hour >= end_hour:
-                instance['desired_state'] = 'running' if start_hour > end_hour else 'stopped'
-            elif current_hour >= start_hour:
-                instance['desired_state'] = 'running'
-            elif current_hour >= end_hour:
-                instance['desired_state'] = 'stopped'
-            else:
-                instances.remove(instance)
+        if current_hour >= start_hour and current_hour >= end_hour:
+            return 'running' if start_hour > end_hour else 'stopped'
+        elif current_hour >= start_hour:
+            return 'running'
+        elif current_hour >= end_hour:
+            return 'stopped'
         else:
-            instances.remove(instance)
+            return None
 
-    print('instances: %s' % instances)
+    else:
+        return None
 
-    # loop through instances and compare current state to desired state
-    ids_to_start = []
-    ids_to_stop = []
 
-    for instance in instances:
-        if instance['state'] != instance['desired_state'] and instance['state'] in ('running', 'stopped'):
-            if instance['desired_state'] == 'stopped':
-                ids_to_stop.append(instance['id'])
-            elif instance['desired_state'] == 'running':
-                ids_to_start.append(instance['id'])
+# batch start instances
+def start_instances(instances):
+    try:
+        response = ec2_client.start_instances(
+            DryRun=dry_run,
+            InstanceIds=instances
+        )
 
-    print('ids_to_start: %s' % ids_to_start)
-    print('ids_to_stop: %s' % ids_to_stop)
+    except Exception as e:
+        print("No action taken - dry_run is true: %s" % e)
+        return False
 
-    # start the appropriate instances
-    if ids_to_start:
-        try:
-            response = ec2_client.start_instances(
-                DryRun=dry_run,
-                InstanceIds=ids_to_start
-            )
-        except:
-            print("Running in DRY_RUN mode.")
+    else:
+        return response
 
-        print('ids_to_start response HTTPStatusCode: %s' % response['ResponseMetadata']['HTTPStatusCode'])
 
-    # stop the appropriate instances
-    if ids_to_stop:
-        try:
-            response = ec2_client.stop_instances(
-                DryRun=dry_run,
-                InstanceIds=ids_to_stop
-            )
-        except:
-            print("Running in DRY_RUN mode.")
+# batch stop instances
+def stop_instances(instances):
+    try:
+        response = ec2_client.stop_instances(
+            DryRun=dry_run,
+            InstanceIds=instances
+        )
 
-        print('ids_to_stop response HTTPStatusCode: %s' % response['ResponseMetadata']['HTTPStatusCode'])
+    except Exception as e:
+        print("No action taken - dry_run is true: %s" % e)
+        return False
 
-    return True
+    else:
+        return response
