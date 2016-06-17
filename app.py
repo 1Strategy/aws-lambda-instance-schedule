@@ -78,11 +78,11 @@ def determine_desired_state(schedule):
         start_hour = schedule[current_day]['s'] if 's' in schedule[current_day] else None
         end_hour = schedule[current_day]['e'] if 'e' in schedule[current_day] else None
 
-        if current_hour >= start_hour and current_hour >= end_hour:
+        if (start_hour and current_hour >= start_hour) and (end_hour and current_hour >= end_hour):
             return 'running' if start_hour > end_hour else 'stopped'
-        elif current_hour >= start_hour:
+        elif start_hour and current_hour >= start_hour:
             return 'running'
-        elif current_hour >= end_hour:
+        elif end_hour and current_hour >= end_hour:
             return 'stopped'
         else:
             return None
